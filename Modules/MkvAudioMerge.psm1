@@ -71,6 +71,50 @@ namespace MkvAudioMerge {
 '@
 }
 
+if (-not ('MkvAudioMerge.CutMath' -as [type])) {
+    Add-Type -TypeDefinition @"
+using System;
+namespace MkvAudioMerge {
+    public static class CutMath {
+        // Correlation of a and b in a sliding window of 2*half+1 frames around
+        // every frame: how well the two envelopes agree at that moment.
+        public static double[] LocalCorrelation(double[] a, double[] b, int half) {
+            int n = Math.Min(a.Length, b.Length);
+            var res = new double[n];
+            for (int i = 0; i < n; i++) {
+                int lo = Math.Max(0, i - half), hi = Math.Min(n - 1, i + half), m = hi - lo + 1;
+                double am = 0, bm = 0;
+                for (int k = lo; k <= hi; k++) { am += a[k]; bm += b[k]; }
+                am /= m; bm /= m;
+                double num = 0, as2 = 0, bs2 = 0;
+                for (int k = lo; k <= hi; k++) { double x = a[k] - am, y = b[k] - bm; num += x * y; as2 += x * x; bs2 += y * y; }
+                res[i] = (as2 > 0 && bs2 > 0) ? num / Math.Sqrt(as2 * bs2) : 0;
+            }
+            return res;
+        }
+
+        // The cut index s that best explains the data: before s the "before"
+        // alignment agrees (simBefore), from s + gap on the "after" alignment
+        // agrees (simAfter). The gap frames in between belong to neither.
+        public static int FindCut(double[] simBefore, double[] simAfter, int gap) {
+            int n = Math.Min(simBefore.Length, simAfter.Length);
+            if (gap < 0) gap = 0;
+            if (n == 0 || gap >= n) return 0;
+            var pre = new double[n + 1];
+            for (int i = 0; i < n; i++) pre[i + 1] = pre[i] + simBefore[i];
+            var suf = new double[n + 1];
+            for (int i = n - 1; i >= 0; i--) suf[i] = suf[i + 1] + simAfter[i];
+            int best = 0; double bestScore = double.NegativeInfinity;
+            for (int s = 0; s + gap <= n; s++) {
+                double score = pre[s] + suf[s + gap];
+                if (score > bestScore) { bestScore = score; best = s; }
+            }
+            return best;
+        }
+    }
+}
+"@
+}
 #region Pure logic
 
 function Get-LanguageCode {
@@ -256,6 +300,29 @@ function Select-BestAudioTrack {
         Select-Object -First 1
 }
 
+function Select-SyncReferenceTrack {
+    <#
+    .SYNOPSIS
+        Picks the primary audio track to measure sync against.
+    .DESCRIPTION
+        Normally the default audio track. When that is TrueHD, which ffmpeg
+        decodes and seeks slowly (about 30 times slower than E-AC-3 per check
+        window), a lossy track in the same language is used instead: releases
+        carry it as a compatibility track with the same mix and timeline. The
+        merged file is not affected; this only chooses what is listened to.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param([Parameter(Mandatory)][AllowEmptyCollection()][pscustomobject[]]$Track)
+
+    $slow = @('A_TRUEHD', 'A_MLP')
+    $audio = @($Track | Where-Object Type -eq 'audio')
+    $main = ($audio | Where-Object Default | Select-Object -First 1) ?? ($audio | Select-Object -First 1)
+    if (-not $main -or $slow -notcontains $main.CodecId) { return $main }
+    $alt = $audio | Where-Object { $_.Id -ne $main.Id -and $_.Language -eq $main.Language -and $slow -notcontains $_.CodecId } |
+        Sort-Object -Stable -Descending Channels | Select-Object -First 1
+    return $alt ?? $main
+}
 function New-MergePlan {
     <#
     .SYNOPSIS
@@ -410,12 +477,7 @@ function Get-SyncVerdict {
     }
     if ($reliable.Count -lt $needed) { return $result }
 
-    $getMedian = {
-        param([double[]]$v)
-        $s = @($v | Sort-Object); $m = [int][math]::Floor($s.Count / 2)
-        ($s.Count % 2) ? $s[$m] : ($s[$m - 1] + $s[$m]) / 2
-    }
-    $median = & $getMedian @($reliable.OffsetMs)
+    $median = Get-Median @($reliable.OffsetMs)
 
     # With enough clear points, one stray measurement with a weak match (a
     # quiet, dialogue-only scene) is noise: set it aside. A stray point with a
@@ -426,7 +488,7 @@ function Get-SyncVerdict {
         if ($stray.Count -eq 1 -and $stray[0].Peak -lt $MaxStrayPeak) {
             $reliable = @($reliable | Where-Object { $_ -ne $stray[0] })
             $result.Outliers = 1
-            $median = & $getMedian @($reliable.OffsetMs)
+            $median = Get-Median @($reliable.OffsetMs)
         }
     }
     $offsets = @($reliable | ForEach-Object OffsetMs | Sort-Object)
@@ -469,8 +531,16 @@ function New-MkvMergeArgument {
         The primary goes in whole. From the secondary only the planned tracks
         are taken; video, attachments, global tags, buttons and (unless the plan
         wants them) chapters are excluded, because mkvmerge would otherwise
-        merge them from every input. Added tracks get default and forced flags
-        cleared so the primary's original audio stays the default.
+        merge them from every input. The secondary is left out entirely when
+        the plan takes nothing from it (for example when its audio was rebuilt
+        by a cut repair).
+
+        After it come the sidecar subtitle and any External tracks (files the
+        tool made, such as a repaired audio track or shifted subtitles), each
+        as its own input with one track.
+
+        Every added track gets its default and forced flags cleared so the
+        primary's original audio stays the default.
     #>
     [CmdletBinding()]
     [OutputType([string[]])]
@@ -482,37 +552,61 @@ function New-MkvMergeArgument {
         [int]$SyncOffsetMs = 0
     )
 
-    $added = @($Plan.Audio) + @($Plan.Subtitles)
+    $audio = ($Plan.PSObject.Properties['Audio'])?.Value
+    $subs = @($Plan.Subtitles | Where-Object { $_ })
+    $side = ($Plan.PSObject.Properties['SidecarSubtitle'])?.Value
+    $external = @((($Plan.PSObject.Properties['External'])?.Value) | Where-Object { $_ })
+
     $a = [Collections.Generic.List[string]]::new()
     $a.AddRange([string[]]@('--gui-mode', '--output', $OutputPath))
-
-    # Primary: everything, unchanged.
     $a.Add($Primary.Path)
 
-    # Secondary: only the planned tracks.
-    $a.AddRange([string[]]@('--no-video', '--no-attachments', '--no-global-tags', '--no-buttons'))
-    $a.AddRange([string[]]@('--audio-tracks', [string]$Plan.Audio.Id))
-    if ($Plan.Subtitles.Count -gt 0) {
-        $a.AddRange([string[]]@('--subtitle-tracks', (($Plan.Subtitles | ForEach-Object Id) -join ',')))
-    } else {
-        $a.Add('--no-subtitles')
-    }
-    if (-not $Plan.Chapters) { $a.Add('--no-chapters') }
-    foreach ($t in $added) {
-        $a.AddRange([string[]]@('--default-track-flag', "$($t.Id):no", '--forced-display-flag', "$($t.Id):no"))
-        if ($SyncOffsetMs -ne 0) { $a.AddRange([string[]]@('--sync', "$($t.Id):$SyncOffsetMs")) }
-    }
-    if ($Plan.Chapters -and $SyncOffsetMs -ne 0) { $a.AddRange([string[]]@('--chapter-sync', [string]$SyncOffsetMs)) }
-    $a.Add($Secondary.Path)
+    $audioOrder = [Collections.Generic.List[string]]::new()
+    $subOrder = [Collections.Generic.List[string]]::new()
+    $fileIndex = 0
 
-    # Sidecar SRT: a third input with one track (ID 0). Only one next to the
-    # secondary shares the secondary's timeline and gets its offset.
-    $side = ($Plan.PSObject.Properties['SidecarSubtitle'])?.Value
+    # Secondary: only the planned tracks.
+    if ($audio -or $subs.Count -gt 0 -or $Plan.Chapters) {
+        $fileIndex++
+        $a.AddRange([string[]]@('--no-video', '--no-attachments', '--no-global-tags', '--no-buttons'))
+        if ($audio) { $a.AddRange([string[]]@('--audio-tracks', [string]$audio.Id)) } else { $a.Add('--no-audio') }
+        if ($subs.Count -gt 0) {
+            $a.AddRange([string[]]@('--subtitle-tracks', (($subs | ForEach-Object Id) -join ',')))
+        } else {
+            $a.Add('--no-subtitles')
+        }
+        if (-not $Plan.Chapters) { $a.Add('--no-chapters') }
+        foreach ($t in @($audio | Where-Object { $_ }) + $subs) {
+            $a.AddRange([string[]]@('--default-track-flag', "$($t.Id):no", '--forced-display-flag', "$($t.Id):no"))
+            if ($SyncOffsetMs -ne 0) { $a.AddRange([string[]]@('--sync', "$($t.Id):$SyncOffsetMs")) }
+        }
+        if ($Plan.Chapters -and $SyncOffsetMs -ne 0) { $a.AddRange([string[]]@('--chapter-sync', [string]$SyncOffsetMs)) }
+        $a.Add($Secondary.Path)
+        if ($audio) { $audioOrder.Add("${fileIndex}:$($audio.Id)") }
+        foreach ($s in $subs) { $subOrder.Add("${fileIndex}:$($s.Id)") }
+    }
+
+    # Sidecar SRT: one track (ID 0). Only one next to the secondary shares the
+    # secondary's timeline and gets its offset.
     if ($side) {
+        $fileIndex++
         $a.AddRange([string[]]@('--language', "0:$($side.LanguageIetf)", '--default-track-flag', '0:no', '--forced-display-flag', '0:no'))
         if ($side.Charset) { $a.AddRange([string[]]@('--sub-charset', "0:$($side.Charset)")) }
         if ($SyncOffsetMs -ne 0 -and $side.Origin -eq 'Secondary') { $a.AddRange([string[]]@('--sync', "0:$SyncOffsetMs")) }
         $a.Add($side.Path)
+        $subOrder.Add("${fileIndex}:0")
+    }
+
+    # Files the tool made: one track each, with their own offset.
+    foreach ($x in $external) {
+        $fileIndex++
+        $a.AddRange([string[]]@('--language', "0:$($x.LanguageIetf)", '--default-track-flag', '0:no', '--forced-display-flag', '0:no'))
+        if ($x.Name) { $a.AddRange([string[]]@('--track-name', "0:$($x.Name)")) }
+        if (($x.PSObject.Properties['Charset'])?.Value) { $a.AddRange([string[]]@('--sub-charset', "0:$($x.Charset)")) }
+        if ($x.SyncMs -ne 0) { $a.AddRange([string[]]@('--sync', "0:$($x.SyncMs)")) }
+        $a.AddRange([string[]]@('--no-global-tags', '--no-chapters'))
+        $a.Add($x.Path)
+        if ($x.Type -eq 'audio') { $audioOrder.Add("${fileIndex}:0") } else { $subOrder.Add("${fileIndex}:0") }
     }
 
     # Order: video, primary audio, added audio, primary subtitles, added subtitles, the rest.
@@ -520,10 +614,9 @@ function New-MkvMergeArgument {
     $prim = $Primary.Tracks
     $prim | Where-Object Type -eq 'video' | ForEach-Object { $order.Add("0:$($_.Id)") }
     $prim | Where-Object Type -eq 'audio' | ForEach-Object { $order.Add("0:$($_.Id)") }
-    $order.Add("1:$($Plan.Audio.Id)")
+    $order.AddRange($audioOrder)
     $prim | Where-Object Type -eq 'subtitles' | ForEach-Object { $order.Add("0:$($_.Id)") }
-    $Plan.Subtitles | ForEach-Object { $order.Add("1:$($_.Id)") }
-    if ($side) { $order.Add('2:0') }
+    $order.AddRange($subOrder)
     $prim | Where-Object Type -notin 'video', 'audio', 'subtitles' | ForEach-Object { $order.Add("0:$($_.Id)") }
     $a.AddRange([string[]]@('--track-order', ($order -join ',')))
 
@@ -545,18 +638,28 @@ function Test-MergedOutput {
         [Parameter(Mandatory)][pscustomobject]$Output
     )
 
+    $audio = ($Plan.PSObject.Properties['Audio'])?.Value
+    $side = ($Plan.PSObject.Properties['SidecarSubtitle'])?.Value
+    $external = @((($Plan.PSObject.Properties['External'])?.Value) | Where-Object { $_ })
+    $extAudio = @($external | Where-Object Type -eq 'audio')
+    $addedAudio = ($audio ? 1 : 0) + $extAudio.Count
+    $addedSubs = @($Plan.Subtitles | Where-Object { $_ }).Count + ($side ? 1 : 0) + @($external | Where-Object Type -eq 'subtitles').Count
+
     $problems = [Collections.Generic.List[string]]::new()
-    $addedSubs = $Plan.Subtitles.Count + ((($Plan.PSObject.Properties['SidecarSubtitle'])?.Value) ? 1 : 0)
-    $expected = $Primary.Tracks.Count + 1 + $addedSubs
+    $expected = $Primary.Tracks.Count + $addedAudio + $addedSubs
     if ($Output.Tracks.Count -ne $expected) {
         $problems.Add("expected $expected tracks, found $($Output.Tracks.Count)")
     }
     if ([math]::Abs($Output.DurationS - $Primary.DurationS) -gt 2) {
         $problems.Add(('duration changed from {0} to {1}' -f (Format-Duration $Primary.DurationS), (Format-Duration $Output.DurationS)))
     }
-    $want = $Plan.Audio
-    if (-not ($Output.Tracks | Where-Object { $_.Type -eq 'audio' -and $_.CodecId -eq $want.CodecId -and $_.Language -eq $want.Language -and $_.Channels -eq $want.Channels })) {
-        $problems.Add("added $($want.Language) audio track is missing")
+    if ($audio -and -not ($Output.Tracks | Where-Object { $_.Type -eq 'audio' -and $_.CodecId -eq $audio.CodecId -and $_.Language -eq $audio.Language -and $_.Channels -eq $audio.Channels })) {
+        $problems.Add("added $($audio.Language) audio track is missing")
+    }
+    foreach ($x in $extAudio) {
+        if (-not ($Output.Tracks | Where-Object { $_.Type -eq 'audio' -and ($_.LanguageIetf -split '-')[0] -eq $x.LanguageIetf -and $_.Channels -eq $x.Channels -and -not $_.Default })) {
+            $problems.Add("added $($x.LanguageIetf) audio track ($($x.Name)) is missing")
+        }
     }
     $outSubs = @($Output.Tracks | Where-Object Type -eq 'subtitles')
     $primSubs = @($Primary.Tracks | Where-Object Type -eq 'subtitles')
@@ -574,6 +677,123 @@ function Test-MergedOutput {
         $problems.Add("default audio should be the primary's $($primDefault.Language) track only")
     }
     return , $problems.ToArray()
+}
+
+function Get-SyncStep {
+    <#
+    .SYNOPSIS
+        Recognizes a single clean jump in the sync measurements.
+    .DESCRIPTION
+        When one release has a few seconds of footage the other lacks (a
+        localized title card, a trimmed shot), the offset is constant up to
+        that point and a different constant after it. This finds that split:
+        every clear point before it agrees on one offset (BeforeMs), every
+        clear point after it on another (AfterMs). Returns nothing when the
+        points do not fit one single jump.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][pscustomobject[]]$Point,
+        [int]$ToleranceMs = 40,
+        [double]$MinPeak = 0.45,
+        [double]$MinMargin = 0.1
+    )
+
+    $r = @($Point | Where-Object { $_.Peak -ge $MinPeak -and ($_.Peak - $_.RunnerUp) -ge $MinMargin -and -not $_.AtEdge } | Sort-Object TimeS)
+    if ($r.Count -lt 3) { return }
+    for ($k = 1; $k -lt $r.Count; $k++) {
+        $before = @($r[0..($k - 1)])
+        $after = @($r[$k..($r.Count - 1)])
+        $mb = Get-Median @($before.OffsetMs)
+        $ma = Get-Median @($after.OffsetMs)
+        if ([math]::Abs($mb - $ma) -le $ToleranceMs) { continue }
+        $tight = -not ($before | Where-Object { [math]::Abs($_.OffsetMs - $mb) -gt $ToleranceMs }) -and
+            -not ($after | Where-Object { [math]::Abs($_.OffsetMs - $ma) -gt $ToleranceMs })
+        if ($tight) {
+            return [pscustomobject]@{
+                BeforeMs    = [int][math]::Round($mb)
+                AfterMs     = [int][math]::Round($ma)
+                LastBeforeS = $before[-1].TimeS
+                FirstAfterS = $after[0].TimeS
+            }
+        }
+    }
+}
+
+function Get-Median {
+    [CmdletBinding()]
+    [OutputType([double])]
+    param([Parameter(Mandatory)][double[]]$Value)
+    $s = @($Value | Sort-Object)
+    $m = [int][math]::Floor($s.Count / 2)
+    return ($s.Count % 2) ? $s[$m] : ($s[$m - 1] + $s[$m]) / 2
+}
+
+function Convert-SrtCut {
+    <#
+    .SYNOPSIS
+        Re-times SRT subtitles across a cut, the way a repaired audio track is re-timed.
+    .DESCRIPTION
+        CutS is in the subtitle file's own timeline.
+          Insert: the film continues GapS later from the cut on (the other
+                  release has extra footage there); cues from the cut on move
+                  GapS later.
+          Remove: GapS of footage from the cut on is not in the other release;
+                  cues inside it are dropped (or clipped), later cues move GapS
+                  earlier.
+        Cues are renumbered. Text is kept as is.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Text,
+        [Parameter(Mandatory)][double]$CutS,
+        [Parameter(Mandatory)][double]$GapS,
+        [Parameter(Mandatory)][ValidateSet('Insert', 'Remove')][string]$Mode
+    )
+
+    $timePattern = '^\s*(\d+):(\d\d):(\d\d)[,.](\d{1,3})\s*-->\s*(\d+):(\d\d):(\d\d)[,.](\d{1,3})(.*)$'
+    $toS = { param($h, $m, $s, $ms) [int]$h * 3600 + [int]$m * 60 + [int]$s + [int]($ms.PadRight(3, '0')) / 1000.0 }
+    $fmt = {
+        param([double]$sec)
+        $msTotal = [long][math]::Round([math]::Max(0.0, $sec) * 1000)
+        # Parentheses matter: the comma binds tighter than %.
+        '{0:00}:{1:00}:{2:00},{3:000}' -f ([math]::Floor($msTotal / 3600000)), ([math]::Floor($msTotal / 60000) % 60), ([math]::Floor($msTotal / 1000) % 60), ($msTotal % 1000)
+    }
+    $end = $CutS + $GapS
+    $blocks = ($Text -replace "`r`n", "`n").Trim("`n", ' ', [char]0xFEFF) -split "`n\s*`n"
+    $out = [Collections.Generic.List[string]]::new()
+    $n = 0
+    foreach ($block in $blocks) {
+        $lines = @($block -split "`n")
+        $ti = -1
+        for ($i = 0; $i -lt [math]::Min(2, $lines.Count); $i++) { if ($lines[$i] -match $timePattern) { $ti = $i; break } }
+        if ($ti -lt 0) { continue }
+        $null = $lines[$ti] -match $timePattern
+        $start = & $toS $Matches[1] $Matches[2] $Matches[3] $Matches[4]
+        $stop = & $toS $Matches[5] $Matches[6] $Matches[7] $Matches[8]
+        $rest = $Matches[9]
+        if ($Mode -eq 'Insert') {
+            if ($start -ge $CutS) { $start += $GapS; $stop += $GapS }
+        } else {
+            if ($stop -le $CutS) {
+                # before the cut: unchanged
+            } elseif ($start -ge $end) {
+                $start -= $GapS; $stop -= $GapS
+            } elseif ($start -ge $CutS -and $stop -le $end) {
+                continue
+            } elseif ($start -lt $CutS) {
+                $stop = $CutS
+            } else {
+                $start = $CutS; $stop -= $GapS
+            }
+        }
+        $n++
+        $body = @($lines | Select-Object -Skip ($ti + 1))
+        $out.Add((@([string]$n, ('{0} --> {1}{2}' -f (& $fmt $start), (& $fmt $stop), $rest)) + $body) -join "`r`n")
+    }
+    return ($out -join "`r`n`r`n") + "`r`n"
 }
 
 function Find-SidecarSubtitle {
@@ -834,11 +1054,205 @@ function Measure-AudioOffset {
     }
 }
 
+function Find-AudioCut {
+    <#
+    .SYNOPSIS
+        Finds, to 10 ms, where one release has footage the other lacks.
+    .DESCRIPTION
+        Given the offset before the jump (BeforeMs) and after it (AfterMs), as
+        secondary time minus primary time, it compares the primary's loudness
+        envelope between FromS and ToS with the secondary's under both
+        alignments, moment by moment, and picks the cut that fits best.
+          Insert  the secondary lacks GapS of footage from PrimaryCutS on
+                  (BeforeMs > AfterMs); the gap must be filled.
+          Remove  the secondary has GapS of extra footage from SecondaryCutS
+                  on; it must be removed.
+        ConfidenceBefore and ConfidenceAfter are the average agreement just
+        before and just after the cut (1.0 is perfect).
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', 'Secondary', Justification = 'Used inside the $aligned script block, which the rule does not follow.')]
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', 'SecondaryTrackId', Justification = 'Used inside the $aligned script block, which the rule does not follow.')]
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)][pscustomobject]$Primary,
+        [Parameter(Mandatory)][int]$PrimaryTrackId,
+        [Parameter(Mandatory)][pscustomobject]$Secondary,
+        [Parameter(Mandatory)][int]$SecondaryTrackId,
+        [Parameter(Mandatory)][int]$BeforeMs,
+        [Parameter(Mandatory)][int]$AfterMs,
+        [Parameter(Mandatory)][double]$FromS,
+        [Parameter(Mandatory)][double]$ToS
+    )
+
+    $frame = 80   # 10 ms at 8 kHz
+    $lengthS = $ToS - $FromS
+    $n = [int][math]::Floor($lengthS * 100)
+    $ref = [MkvAudioMerge.SyncMath]::Envelope((Read-AudioWindow -Path $Primary.Path -TrackId $PrimaryTrackId -StartS $FromS -LengthS $lengthS), $frame)
+
+    $aligned = {
+        param([int]$offsetMs)
+        $start = $FromS + $offsetMs / 1000.0
+        $leadS = 0.0
+        if ($start -lt 0) { $leadS = -$start; $start = 0 }
+        $env = [MkvAudioMerge.SyncMath]::Envelope((Read-AudioWindow -Path $Secondary.Path -TrackId $SecondaryTrackId -StartS $start -LengthS ($lengthS - $leadS)), $frame)
+        $buf = [double[]]::new($n)
+        $lead = [int][math]::Round($leadS * 100)
+        [Array]::Copy($env, 0, $buf, [math]::Min($lead, $n), [math]::Max(0, [math]::Min($env.Length, $n - $lead)))
+        , $buf
+    }
+    $refBuf = [double[]]::new($n)
+    [Array]::Copy($ref, $refBuf, [math]::Min($ref.Length, $n))
+    $simBefore = [MkvAudioMerge.CutMath]::LocalCorrelation($refBuf, (& $aligned $BeforeMs), 50)
+    $simAfter = [MkvAudioMerge.CutMath]::LocalCorrelation($refBuf, (& $aligned $AfterMs), 50)
+
+    $insert = $BeforeMs -gt $AfterMs
+    $gapMs = [math]::Abs($BeforeMs - $AfterMs)
+    $gapFrames = $insert ? [int][math]::Round($gapMs / 10.0) : 0
+    $s = [MkvAudioMerge.CutMath]::FindCut($simBefore, $simAfter, $gapFrames)
+
+    $mean = {
+        param([double[]]$v, [int]$from, [int]$to)
+        $from = [math]::Max(0, $from); $to = [math]::Min($v.Length, $to)
+        if ($to -le $from) { return 0.0 }
+        $sum = 0.0; for ($i = $from; $i -lt $to; $i++) { $sum += $v[$i] }
+        $sum / ($to - $from)
+    }
+    $cutS = $FromS + $s / 100.0
+    [pscustomobject]@{
+        Mode             = $insert ? 'Insert' : 'Remove'
+        PrimaryCutS      = [math]::Round($cutS, 2)
+        SecondaryCutS    = [math]::Round($cutS + $BeforeMs / 1000.0, 2)
+        GapS             = $gapMs / 1000.0
+        BeforeMs         = $BeforeMs
+        AfterMs          = $AfterMs
+        ConfidenceBefore = [math]::Round((& $mean $simBefore ($s - 500) $s), 2)
+        ConfidenceAfter  = [math]::Round((& $mean $simAfter ($s + $gapFrames) ($s + $gapFrames + 500)), 2)
+    }
+}
+
+function Get-AudioStreamFormat {
+    <#
+    .SYNOPSIS
+        Reads sample rate and channel layout of one stream with ffprobe.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][int]$TrackId)
+
+    $json = (& ffprobe -v error -show_entries 'stream=index,sample_rate,channels,channel_layout' -of json $Path) -join "`n" | ConvertFrom-Json
+    $s = $json.streams | Where-Object index -eq $TrackId | Select-Object -First 1
+    if (-not $s) { throw "ffprobe found no stream $TrackId in '$Path'." }
+    [pscustomobject]@{
+        SampleRate = [int]$s.sample_rate
+        Channels   = [int]$s.channels
+        Layout     = [string](($s.PSObject.Properties['channel_layout'])?.Value ?? '')
+    }
+}
+
+function New-RepairedAudioTrack {
+    <#
+    .SYNOPSIS
+        Rebuilds the secondary's audio track across a cut, re-encoded with ffmpeg.
+    .DESCRIPTION
+        Insert: secondary audio up to the cut, then GapS of the primary's audio
+        from the matching point (so the missing shot has sound), then the rest
+        of the secondary audio. Remove: the secondary's extra GapS is cut out.
+        The result stays in the secondary's timeline before the cut; place it
+        with a sync of -BeforeMs. AC-3 is re-encoded as AC-3 at 640 kb/s, other
+        codecs as E-AC-3 at 640 kb/s or the original bitrate if higher.
+    .OUTPUTS
+        The path of the Matroska audio file written.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)][pscustomobject]$Primary,
+        [Parameter(Mandatory)][int]$PrimaryTrackId,
+        [Parameter(Mandatory)][pscustomobject]$Secondary,
+        [Parameter(Mandatory)][pscustomobject]$SecondaryTrack,
+        [Parameter(Mandatory)][pscustomobject]$Cut,
+        [Parameter(Mandatory)][string]$OutputPath
+    )
+
+    $inv = [Globalization.CultureInfo]::InvariantCulture
+    $fmt = Get-AudioStreamFormat -Path $Secondary.Path -TrackId $SecondaryTrack.Id
+    $layout = $fmt.Layout ? $fmt.Layout : "$($fmt.Channels)c"
+    $norm = "aresample=$($fmt.SampleRate),aformat=sample_fmts=fltp:channel_layouts=$layout,asetpts=PTS-STARTPTS"
+    $c = $Cut.SecondaryCutS.ToString('0.000', $inv)
+    $sid = $SecondaryTrack.Id
+
+    $inputs = [Collections.Generic.List[string]]::new()
+    $inputs.AddRange([string[]]@('-i', $Secondary.Path))
+    if ($Cut.Mode -eq 'Insert') {
+        $inputs.AddRange([string[]]@('-ss', $Cut.PrimaryCutS.ToString('0.000', $inv), '-t', $Cut.GapS.ToString('0.000', $inv), '-i', $Primary.Path))
+        $graph = "[0:$sid]asplit=2[s1][s2];[s1]atrim=end=$c,$norm[a1];[s2]atrim=start=$c,$norm[a2];" +
+            "[1:$PrimaryTrackId]$norm[f];[a1][f][a2]concat=n=3:v=0:a=1[out]"
+    } else {
+        $c2 = ($Cut.SecondaryCutS + $Cut.GapS).ToString('0.000', $inv)
+        $graph = "[0:$sid]asplit=2[s1][s2];[s1]atrim=end=$c,$norm[a1];[s2]atrim=start=$c2,$norm[a2];[a1][a2]concat=n=2:v=0:a=1[out]"
+    }
+    if ($SecondaryTrack.CodecId -eq 'A_AC3') {
+        $codec = 'ac3'; $bitrate = 640000
+    } else {
+        $codec = 'eac3'; $bitrate = [math]::Max(640000, $SecondaryTrack.Bps)
+    }
+    $ffArgs = @('-v', 'error', '-nostdin', '-y', '-nostats', '-progress', 'pipe:1') + $inputs +
+        @('-filter_complex', $graph, '-map', '[out]', '-c:a', $codec, '-b:a', "$bitrate", '-f', 'matroska', $OutputPath)
+    $errors = [Collections.Generic.List[string]]::new()
+    & ffmpeg @ffArgs 2>&1 | ForEach-Object {
+        if ($_ -is [Management.Automation.ErrorRecord]) {
+            $errors.Add([string]$_)
+        } elseif ([string]$_ -match '^out_time_us=(\d+)' -and $Secondary.DurationS -gt 0) {
+            $pct = [math]::Min(100.0, [long]$Matches[1] / 1e6 / $Secondary.DurationS * 100)
+            Write-Progress -Activity 'Rebuilding the audio track' -Status ('{0:0}%' -f $pct) -PercentComplete $pct
+        }
+    }
+    $exit = $LASTEXITCODE
+    Write-Progress -Activity 'Rebuilding the audio track' -Completed
+    if ($exit -ne 0) { throw "ffmpeg could not rebuild the audio track (exit code $exit): $($errors | Select-Object -Last 3)" }
+    return $OutputPath
+}
+
+function New-RepairedSubtitle {
+    <#
+    .SYNOPSIS
+        Extracts an SRT track (or reads an SRT file) and re-times it across a cut.
+    .OUTPUTS
+        The path of the UTF-8 SRT file written.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)][pscustomobject]$Cut,
+        [Parameter(Mandatory)][string]$OutputPath,
+        [string]$MkvPath,
+        [int]$TrackId = -1,
+        [string]$SrtPath,
+        [string]$Charset = 'UTF-8'
+    )
+
+    if ($SrtPath) {
+        $text = [IO.File]::ReadAllText($SrtPath, [Text.Encoding]::GetEncoding($Charset))
+    } else {
+        $raw = "$OutputPath.extracted.srt"
+        & mkvextract $MkvPath tracks "${TrackId}:$raw" | Out-Null
+        if ($LASTEXITCODE -ge 2) { throw "mkvextract could not extract subtitle track $TrackId (exit code $LASTEXITCODE)." }
+        $text = [IO.File]::ReadAllText($raw, [Text.Encoding]::UTF8)
+        Remove-Item -LiteralPath $raw
+    }
+    $fixed = Convert-SrtCut -Text $text -CutS $Cut.SecondaryCutS -GapS $Cut.GapS -Mode $Cut.Mode
+    [IO.File]::WriteAllText($OutputPath, $fixed, [Text.UTF8Encoding]::new($false))
+    return $OutputPath
+}
+
 #endregion
 
 Export-ModuleMember -Function @(
     'Get-LanguageCode', 'ConvertTo-MkvTrack', 'ConvertTo-MkvInfo', 'Test-TrackLanguage', 'Get-UntaggedTrack'
-    'Select-BestAudioTrack', 'New-MergePlan', 'Get-SyncVerdict', 'New-MkvMergeArgument', 'Test-MergedOutput'
+    'Select-BestAudioTrack', 'Select-SyncReferenceTrack', 'New-MergePlan', 'Get-SyncVerdict', 'New-MkvMergeArgument', 'Test-MergedOutput'
     'Find-SidecarSubtitle', 'Get-TextCharset', 'ConvertFrom-PastedPath', 'Format-Duration', 'Format-Size', 'Format-ChannelLayout', 'Format-TrackLine'
-    'Get-MkvInfo', 'Read-AudioWindow', 'Measure-AudioOffset'
+    'Get-SyncStep', 'Convert-SrtCut', 'Get-Median'
+    'Get-MkvInfo', 'Read-AudioWindow', 'Measure-AudioOffset', 'Find-AudioCut', 'Get-AudioStreamFormat'
+    'New-RepairedAudioTrack', 'New-RepairedSubtitle'
 )

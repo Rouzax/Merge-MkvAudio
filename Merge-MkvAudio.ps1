@@ -26,6 +26,12 @@
     cut differently. A fixed offset is corrected automatically: the added
     tracks are shifted by the measured amount and the check is run again with
     the shift applied; the offset is used only if that re-check is in sync.
+    When the offset changes once (one release has a few seconds of footage
+    the other lacks, such as a localized title card), the cut is located to
+    10 ms and can be repaired: the added audio is rebuilt across it with
+    ffmpeg (missing footage is filled with the primary's own audio, extra
+    footage is cut out), re-encoded, and checked again; the added subtitles
+    are re-timed to match.
     It does not merge unless the audio is in sync (or you pass -Force).
 
     The merge is written to a temporary .partial file next to the primary and
@@ -62,6 +68,21 @@
 .PARAMETER KeepBackup
     Keep the original primary as "<name>.mkv.bak" instead of deleting it after a verified merge.
 
+.PARAMETER RepairCut
+    When the sync check finds one clean cut (one release has a few seconds of
+    footage the other lacks), repair it without asking: the added audio is
+    rebuilt across the cut and re-encoded, and the added subtitles re-timed.
+    Interactive mode asks instead.
+
+.PARAMETER MaxRepairGapS
+    The longest gap a cut repair may fill or remove, in seconds. Default 30:
+    a few seconds of original-language sound in a dub go unnoticed, minutes
+    do not.
+
+.PARAMETER OutputPath
+    Write the merged file here instead of replacing the primary, which is then
+    left untouched (useful when the primary is still seeding).
+
 .EXAMPLE
     .\Merge-MkvAudio.ps1
 
@@ -90,7 +111,10 @@ param(
     [int]$SyncOffsetMs = 0,
     [switch]$SkipSyncCheck,
     [switch]$Force,
-    [switch]$KeepBackup
+    [switch]$KeepBackup,
+    [switch]$RepairCut,
+    [ValidateRange(0, 600)][double]$MaxRepairGapS = 30,
+    [string]$OutputPath
 )
 
 $ErrorActionPreference = 'Stop'
@@ -206,7 +230,7 @@ function Read-MkvPath([string]$Prompt) {
 #endregion
 
 function Invoke-SyncCheck {
-    param($PrimaryInfo, [int]$PrimaryTrackId, $SecondaryInfo, [int]$SecondaryTrackId, [int]$OffsetMs, [string]$What)
+    param($PrimaryInfo, [int]$PrimaryTrackId, $SecondaryInfo, [int]$SecondaryTrackId, [int]$OffsetMs, [string]$What, [double[]]$At)
 
     Write-Host "    $($script:Dim)comparing $What$($script:Reset)"
     $onPoint = {
@@ -222,10 +246,140 @@ function Invoke-SyncCheck {
             $color, ('█' * $bars), ($script:Dim + ('░' * (10 - $bars))), $script:Dim, $match, $note)
         Write-Progress -Activity 'Sync check' -Status "point $i of $n" -PercentComplete ($i / $n * 100)
     }
-    $points = @(Measure-AudioOffset -Primary $PrimaryInfo -PrimaryTrackId $PrimaryTrackId -Secondary $SecondaryInfo `
-            -SecondaryTrackId $SecondaryTrackId -AppliedOffsetMs $OffsetMs -OnPoint $onPoint)
+    $measure = @{
+        Primary = $PrimaryInfo; PrimaryTrackId = $PrimaryTrackId; Secondary = $SecondaryInfo
+        SecondaryTrackId = $SecondaryTrackId; AppliedOffsetMs = $OffsetMs; OnPoint = $onPoint
+    }
+    if ($At) { $measure.At = $At }
+    $points = @(Measure-AudioOffset @measure)
     Write-Progress -Activity 'Sync check' -Completed
-    return Get-SyncVerdict -Point $points
+    $verdict = Get-SyncVerdict -Point $points
+    $verdict | Add-Member -NotePropertyName Points -NotePropertyValue $points
+    return $verdict
+}
+
+function Invoke-CutRepair {
+    <#
+    Handles a single clean jump in the sync check: one release has a few
+    seconds of footage the other lacks. Locates the cut, rebuilds the added
+    audio across it (and re-times the added subtitles), and re-checks sync.
+    On success the plan's secondary tracks are replaced by the rebuilt files
+    (plan.External) and the new verdict is returned; otherwise $null.
+    #>
+    param($PrimaryInfo, $PrimaryAudio, $SecondaryInfo, $Plan, $Lang, $Step, [int]$AppliedOffsetMs, [bool]$Interactive, [bool]$Allow, [double]$MaxGapS)
+
+    # Offsets as secondary time minus primary time, without the applied shift.
+    $before = $Step.BeforeMs - $AppliedOffsetMs
+    $after = $Step.AfterMs - $AppliedOffsetMs
+    $inv = [Globalization.CultureInfo]::InvariantCulture
+    Write-Host ''
+    Write-Mark info ('The offset changes once, between {0} and {1}: one cut, not a different edit throughout' -f (Format-Duration $Step.LastBeforeS), (Format-Duration $Step.FirstAfterS))
+    Write-Progress -Activity 'Locating the cut' -Status 'comparing the soundtracks moment by moment'
+    $cut = Find-AudioCut -Primary $PrimaryInfo -PrimaryTrackId $PrimaryAudio.Id -Secondary $SecondaryInfo -SecondaryTrackId $Plan.Audio.Id `
+        -BeforeMs $before -AfterMs $after -FromS $Step.LastBeforeS -ToS ($Step.FirstAfterS + 30)
+    Write-Progress -Activity 'Locating the cut' -Completed
+
+    $at = '{0}.{1:00}' -f (Format-Duration ([math]::Floor($cut.PrimaryCutS))), [int](($cut.PrimaryCutS % 1) * 100)
+    $gap = $cut.GapS.ToString('0.00', $inv)
+    $found = ($cut.Mode -eq 'Insert') ? "The $($Lang.Name) release is missing $gap s of footage at $at" : "The $($Lang.Name) release has $gap s of extra footage at $at"
+    Write-Mark warn $found ('agreement {0} before the cut, {1} after' -f $cut.ConfidenceBefore.ToString('0.00', $inv), $cut.ConfidenceAfter.ToString('0.00', $inv))
+    if ($cut.ConfidenceBefore -lt 0.5 -or $cut.ConfidenceAfter -lt 0.5) {
+        Write-Mark fail 'The cut could not be located reliably, so it is not repaired.'
+        return $null
+    }
+    # A few seconds of original-language sound in a dub go unnoticed; minutes do not.
+    if ($cut.GapS -gt $MaxGapS) {
+        Write-Mark fail ('The gap is longer than {0} s, so it is not repaired automatically.' -f $MaxGapS) 'raise -MaxRepairGapS to allow it'
+        return $null
+    }
+    $how = ($cut.Mode -eq 'Insert') ? "fill the $gap s with the primary's $($PrimaryAudio.Language) audio" : "cut the extra $gap s out"
+    Write-Mark info "Repair: rebuild the $($Lang.Name) audio across the cut ($how), re-encoded; re-time the $($Lang.Name) subtitles to match."
+    if ($WhatIfPreference) {
+        Write-Mark info 'What if: the repaired track is not built or re-checked.'
+        return [pscustomobject]@{ Verdict = 'InSync'; Points = @() }
+    }
+    if ($Interactive) {
+        if (-not (Read-YesNo 'Repair the cut?' $true)) { return $null }
+    } elseif (-not $Allow) {
+        Write-Mark info 'Pass -RepairCut to repair it.'
+        return $null
+    }
+
+    $tmp = Join-Path ([IO.Path]::GetTempPath()) ('Merge-MkvAudio-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    New-Item -ItemType Directory -Path $tmp | Out-Null
+    $script:TempDirs.Add($tmp)
+
+    $timer = [Diagnostics.Stopwatch]::StartNew()
+    $audioPath = New-RepairedAudioTrack -Primary $PrimaryInfo -PrimaryTrackId $PrimaryAudio.Id -Secondary $SecondaryInfo `
+        -SecondaryTrack $Plan.Audio -Cut $cut -OutputPath (Join-Path $tmp 'audio.mka')
+    $rebuilt = Get-MkvInfo $audioPath
+    Write-Mark ok "Rebuilt the $($Lang.Name) audio track" ('{0}, {1}, in {2}' -f (Format-TrackLine $rebuilt.Tracks[0] -NoFlags), (Format-Duration $rebuilt.DurationS), (Format-Duration $timer.Elapsed.TotalSeconds))
+
+    # Re-check: the usual seven points plus four close around the cut.
+    $syncMs = -$before
+    $span = [math]::Min($PrimaryInfo.DurationS, $rebuilt.DurationS) - 30
+    $primaryGap = ($cut.Mode -eq 'Insert') ? $cut.GapS : 0
+    $near = @(($cut.PrimaryCutS - 75), ($cut.PrimaryCutS - 35), ($cut.PrimaryCutS + $primaryGap + 5), ($cut.PrimaryCutS + $primaryGap + 45)) |
+        Where-Object { $_ -ge 0 -and $_ -le $span }
+    $points = @(@(0.05, 0.2, 0.35, 0.5, 0.65, 0.8, 0.95) + @($near | ForEach-Object { $_ / $span }) | Sort-Object)
+    Write-Host ''
+    $recheck = Invoke-SyncCheck $PrimaryInfo $PrimaryAudio.Id $rebuilt 0 $syncMs "primary with the rebuilt $($Lang.Name) track" -At $points
+    Write-SyncVerdict $recheck $syncMs
+    if ($recheck.Verdict -ne 'InSync') {
+        Write-Mark fail 'The rebuilt track is not in sync, so it is not used.'
+        return $null
+    }
+
+    # Dense scan of the whole stretch that held the jump, every 20 s. A second
+    # cut close to the first would look like one bigger jump at the seven
+    # points; any part placed wrongly by the repair shows up here.
+    $fromS = [math]::Max(0.0, $Step.LastBeforeS)
+    $toS = [math]::Min($Step.FirstAfterS + 30, $span)
+    $denseSpan = [math]::Min($PrimaryInfo.DurationS, $rebuilt.DurationS) - 15
+    $times = for ($t = $fromS; $t -le $toS; $t += 20) { $t }
+    Write-Host ''
+    Write-Host ("    $($script:Dim)scanning {0} to {1} every 20 s ({2} points)$($script:Reset)" -f (Format-Duration $fromS), (Format-Duration $toS), @($times).Count)
+    # $args: point, index, count (the point itself is not needed here).
+    $onDense = { Write-Progress -Activity 'Scanning around the cut' -Status "point $($args[1]) of $($args[2])" -PercentComplete ($args[1] / $args[2] * 100) }
+    $dense = @(Measure-AudioOffset -Primary $PrimaryInfo -PrimaryTrackId $PrimaryAudio.Id -Secondary $rebuilt -SecondaryTrackId 0 `
+            -AppliedOffsetMs $syncMs -At @($times | ForEach-Object { $_ / $denseSpan }) -WindowS 15 -SearchS 10 -OnPoint $onDense)
+    Write-Progress -Activity 'Scanning around the cut' -Completed
+    $denseVerdict = Get-SyncVerdict -Point $dense
+    $off = @($dense | Where-Object { $_.Peak -ge 0.45 -and ($_.Peak - $_.RunnerUp) -ge 0.1 -and -not $_.AtEdge -and [math]::Abs($_.OffsetMs) -gt 40 })
+    if ($denseVerdict.Verdict -ne 'InSync') {
+        foreach ($p in $off) { Write-Mark fail ('{0}  {1:+0;-0;0} ms' -f (Format-Duration $p.TimeS), $p.OffsetMs) 'out of sync here' }
+        Write-Mark fail "The stretch around the cut is not in sync everywhere ($($denseVerdict.Verdict)): probably more than one cut. Not repaired."
+        return $null
+    }
+    Write-Mark ok 'Stretch around the cut in sync' ("$($denseVerdict.Reliable) of $($denseVerdict.Total) points clear, largest deviation $($denseVerdict.DeviationMs) ms")
+
+    $external = [Collections.Generic.List[pscustomobject]]::new()
+    $external.Add([pscustomobject]@{
+            Type = 'audio'; Path = $audioPath; LanguageIetf = $Lang.Ietf; Name = $Plan.Audio.Name
+            Channels = $Plan.Audio.Channels; SyncMs = $syncMs
+        })
+    $n = 0
+    foreach ($s in $Plan.Subtitles) {
+        $n++
+        $srt = New-RepairedSubtitle -Cut $cut -OutputPath (Join-Path $tmp "subtitle$n.srt") -MkvPath $SecondaryInfo.Path -TrackId $s.Id
+        $external.Add([pscustomobject]@{ Type = 'subtitles'; Path = $srt; LanguageIetf = $Lang.Ietf; Name = $s.Name; Charset = 'UTF-8'; SyncMs = $syncMs })
+    }
+    $side = $Plan.SidecarSubtitle
+    if ($side -and $side.Origin -eq 'Secondary') {
+        $n++
+        $srt = New-RepairedSubtitle -Cut $cut -OutputPath (Join-Path $tmp "subtitle$n.srt") -SrtPath $side.Path -Charset ($side.Charset ?? 'UTF-8')
+        $external.Add([pscustomobject]@{ Type = 'subtitles'; Path = $srt; LanguageIetf = $Lang.Ietf; Name = ''; Charset = 'UTF-8'; SyncMs = $syncMs })
+        $Plan.SidecarSubtitle = $null
+    }
+    if ($n -gt 0) { Write-Mark ok "Re-timed $n $($Lang.Name) subtitle track(s) across the cut" }
+    if ($Plan.Chapters) {
+        $Plan.Chapters = $false
+        Write-Mark warn "The secondary's chapters are skipped: they follow the other cut."
+    }
+    $Plan.Audio = $null
+    $Plan.Subtitles = @()
+    $Plan | Add-Member -NotePropertyName External -NotePropertyValue $external -Force
+    return $recheck
 }
 
 function Write-SyncVerdict($Verdict, [int]$OffsetMs) {
@@ -267,7 +421,10 @@ function Invoke-Merge {
         [int]$SyncOffsetMs,
         [bool]$SkipSyncCheck,
         [bool]$Force,
-        [bool]$KeepBackup
+        [bool]$KeepBackup,
+        [bool]$RepairCut,
+        [double]$MaxRepairGapS,
+        [string]$OutputPath
     )
 
     $lang = Get-LanguageCode $LanguageCode
@@ -341,8 +498,10 @@ function Invoke-Merge {
         Write-Mark warn 'Sync check skipped (-SkipSyncCheck)'
     } else {
         Write-Title 'Sync check'
-        $primAudio = ($prim.Tracks | Where-Object { $_.Type -eq 'audio' -and $_.Default } | Select-Object -First 1) ??
-            ($prim.Tracks | Where-Object Type -eq 'audio' | Select-Object -First 1)
+        $primAudio = Select-SyncReferenceTrack $prim.Tracks
+        if (-not $primAudio.Default) {
+            Write-Mark info "Listening to primary #$($primAudio.Id) $($primAudio.Codec) for the checks" "same mix as the default track, much faster to decode than TrueHD"
+        }
         $syncTrackId = $plan.Audio.Id
         $verdict = Invoke-SyncCheck $prim $primAudio.Id $sec $syncTrackId $offsetMs `
             "primary #$($primAudio.Id) $($primAudio.Language) with secondary #$($plan.Audio.Id) $($plan.Audio.Language)"
@@ -379,6 +538,16 @@ function Invoke-Merge {
                 $verdict = $recheck
             }
         }
+
+        # One clean jump (a shot one release lacks) can be repaired.
+        if ($verdict.Verdict -eq 'Inconsistent' -and $syncTrackId -eq $plan.Audio.Id) {
+            $step = Get-SyncStep -Point $verdict.Points
+            if ($step) {
+                $repaired = Invoke-CutRepair -PrimaryInfo $prim -PrimaryAudio $primAudio -SecondaryInfo $sec -Plan $plan -Lang $lang `
+                    -Step $step -AppliedOffsetMs $offsetMs -Interactive $Interactive -Allow $RepairCut -MaxGapS $MaxRepairGapS
+                if ($repaired) { $verdict = $repaired }
+            }
+        }
         $syncOk = $verdict.Verdict -eq 'InSync'
     }
 
@@ -394,23 +563,31 @@ function Invoke-Merge {
         }
     }
 
-    # Output paths and space
-    $dir = Split-Path $prim.Path -Parent
-    $partial = Join-Path $dir ([IO.Path]::GetFileNameWithoutExtension($prim.Path) + '.merging.mkv.partial')
-    $backup = "$($prim.Path).bak"
-    if (Test-Path -LiteralPath $backup) {
-        Write-Mark fail "A backup already exists: $(Split-Path $backup -Leaf)" 'delete or move it first'
-        return $false
+    # Output paths and space. With -OutputPath the primary is left untouched.
+    $replace = -not $OutputPath
+    if ($replace) {
+        $target = $prim.Path
+        $partial = Join-Path (Split-Path $prim.Path -Parent) ([IO.Path]::GetFileNameWithoutExtension($prim.Path) + '.merging.mkv.partial')
+        $backup = "$($prim.Path).bak"
+        if (Test-Path -LiteralPath $backup) {
+            Write-Mark fail "A backup already exists: $(Split-Path $backup -Leaf)" 'delete or move it first'
+            return $false
+        }
+    } else {
+        $target = $PSCmdlet.GetUnresolvedProviderPathFromPSPath($OutputPath)
+        $partial = "$target.partial"
+        if (Test-Path -LiteralPath $target) { Write-Mark fail "The output file already exists: $target"; return $false }
+        if (-not (Test-Path -LiteralPath (Split-Path $target -Parent) -PathType Container)) { Write-Mark fail "The output folder does not exist: $(Split-Path $target -Parent)"; return $false }
     }
-    $addedBytes = (@($plan.Audio) | Measure-Object Bps -Sum).Sum / 8 * $prim.DurationS
-    $needed = $prim.Size + $addedBytes + 512MB
-    $free = ([IO.DriveInfo]::new([IO.Path]::GetPathRoot($prim.Path))).AvailableFreeSpace
+    $audioBps = $plan.Audio ? $plan.Audio.Bps : 640000
+    $needed = $prim.Size + $audioBps / 8 * $prim.DurationS + 512MB
+    $free = ([IO.DriveInfo]::new([IO.Path]::GetPathRoot($target))).AvailableFreeSpace
     if ($free -lt $needed) {
         Write-Mark fail "Not enough free space: $(Format-Size $needed) needed, $(Format-Size $free) free"
         return $false
     }
 
-    if (-not $WhatIfPreference -and -not (Wait-FileUnlocked $prim.Path)) {
+    if ($replace -and -not $WhatIfPreference -and -not (Wait-FileUnlocked $prim.Path)) {
         Write-Mark fail 'The primary is still in use after 10 minutes. Close whatever has it open and try again.'
         return $false
     }
@@ -422,8 +599,9 @@ function Invoke-Merge {
         Write-Host ''
         if (-not (Read-YesNo "Merge now? About $(Format-Size $needed) is written next to the primary." $true)) { return $false }
     }
-    $what = "Merge $($lang.Name) tracks from '$($sec.Name)'" + ($KeepBackup ? ' (original kept as .bak)' : ' (original deleted once verified)')
-    if (-not $PSCmdlet.ShouldProcess($prim.Path, $what)) {
+    $what = "Merge $($lang.Name) tracks from '$($sec.Name)'" +
+        ((-not $replace) ? " into a new file (the primary is not changed)" : ($KeepBackup ? ' (original kept as .bak)' : ' (original deleted once verified)'))
+    if (-not $PSCmdlet.ShouldProcess($target, $what)) {
         return $true
     }
 
@@ -454,6 +632,16 @@ function Invoke-Merge {
             return $false
         }
         Write-Mark ok 'Merged file verified' "$($out.Tracks.Count) tracks, $(Format-Duration $out.DurationS), $($out.Chapters) chapters"
+
+        if (-not $replace) {
+            Rename-Item -LiteralPath $partial -NewName (Split-Path $target -Leaf)
+            $done = $true
+            Write-Title 'Done'
+            Write-FileSummary 'Result' (Get-MkvInfo $target)
+            Write-Host ''
+            Write-Mark info 'The primary was not changed.'
+            return $true
+        }
 
         # Something may have opened the primary during the merge; wait rather than lose the merge.
         if (-not (Wait-FileUnlocked $prim.Path)) {
@@ -491,6 +679,7 @@ foreach ($tool in 'mkvmerge', 'ffmpeg') {
     if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) { throw "$tool was not found on PATH." }
 }
 
+$script:TempDirs = [Collections.Generic.List[string]]::new()
 $interactive = -not ($Primary -and $Secondary)
 Write-Host ''
 Write-Host "  $($script:Bold)Merge-MkvAudio$($script:Reset)  $($script:Dim)add $((Get-LanguageCode $Language).Name) audio to an MKV$($script:Reset)"
@@ -515,11 +704,17 @@ do {
             SkipSyncCheck = $SkipSyncCheck.IsPresent
             Force         = $Force.IsPresent
             KeepBackup    = $KeepBackup.IsPresent
+            RepairCut     = $RepairCut.IsPresent
+            MaxRepairGapS = $MaxRepairGapS
+            OutputPath    = $OutputPath
         }
         $null = Invoke-Merge @mergeOptions
     } catch {
         if (-not $interactive) { throw }
         Write-Mark fail $_.Exception.Message
+    } finally {
+        foreach ($d in $script:TempDirs) { Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue }
+        $script:TempDirs.Clear()
     }
 } while ($interactive -and (Read-YesNo 'Merge another pair?' $false))
 Write-Host ''

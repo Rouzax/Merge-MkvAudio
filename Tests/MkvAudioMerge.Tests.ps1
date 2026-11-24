@@ -370,3 +370,108 @@ Describe 'New-MergePlan with sidecars' {
         $a[($a.IndexOf('D:\y.mkv') + 1)..($a.Count - 1)] | Should -Not -Contain '0:200'
     }
 }
+Describe 'Convert-SrtCut' {
+    BeforeAll {
+        $script:srt = "1`r`n00:12:20,000 --> 00:12:22,500`r`nVoor`r`n`r`n2`r`n00:12:29,000 --> 00:12:31,000`r`nOver de knip`r`n`r`n3`r`n00:12:32,000 --> 00:12:34,000`r`nIn het gat`r`n`r`n4`r`n01:00:00,100 --> 01:00:02,000`r`nNa`r`n"
+    }
+    It 'moves cues from the cut on later when footage is inserted' {
+        $out = Convert-SrtCut -Text $srt -CutS 749.67 -GapS 6.76 -Mode Insert
+        $out | Should -Match '00:12:20,000 --> 00:12:22,500'
+        $out | Should -Match '00:12:29,000 --> 00:12:31,000'   # starts before the cut: unchanged
+        $out | Should -Match '00:12:38,760 --> 00:12:40,760'
+        $out | Should -Match '01:00:06,860 --> 01:00:08,760'
+    }
+    It 'drops, clips and moves cues when footage is removed' {
+        $out = Convert-SrtCut -Text $srt -CutS 750 -GapS 5 -Mode Remove
+        $out | Should -Match "1`r`n00:12:20,000 --> 00:12:22,500"
+        $out | Should -Match '00:12:29,000 --> 00:12:30,000'   # clipped at the cut
+        $out | Should -Not -Match 'In het gat'                   # inside the removed part
+        $out | Should -Match "3`r`n00:59:55,100 --> 00:59:57,000"
+    }
+    It 'accepts LF line endings, a BOM and dot milliseconds' {
+        $text = [char]0xFEFF + "1`n00:00:01.5 --> 00:00:02.250`nHoi`n"
+        Convert-SrtCut -Text $text -CutS 0 -GapS 1 -Mode Insert | Should -Match '00:00:02,500 --> 00:00:03,250'
+    }
+}
+
+Describe 'Get-SyncStep' {
+    BeforeAll {
+        function New-StepPoint([int[]]$Offsets) {
+            $i = 0
+            foreach ($o in $Offsets) { [pscustomobject]@{ TimeS = 268 + 804 * $i++; OffsetMs = $o; Peak = 0.85; RunnerUp = 0.3; AtEdge = $false } }
+        }
+    }
+    It 'finds one jump, even with a single point before it' {
+        $step = Get-SyncStep (New-StepPoint 0, -6760, -6760, -6760, -6760, -6760, -6760)
+        $step.BeforeMs | Should -Be 0
+        $step.AfterMs | Should -Be -6760
+        $step.LastBeforeS | Should -Be 268
+        $step.FirstAfterS | Should -Be 1072
+    }
+    It 'finds a jump the other way' {
+        (Get-SyncStep (New-StepPoint -500, -500, -500, 2500, 2500, 2500, 2500)).AfterMs | Should -Be 2500
+    }
+    It 'returns nothing for two jumps or no jump' {
+        Get-SyncStep (New-StepPoint 0, 0, 3000, 3000, -2000, -2000, -2000) | Should -BeNullOrEmpty
+        Get-SyncStep (New-StepPoint 0, 0, 0, 0, 0, 0, 0) | Should -BeNullOrEmpty
+    }
+}
+
+Describe 'CutMath' {
+    It 'finds the cut between two alignments, skipping the gap' {
+        # 0..299 agrees before, 300..349 is the gap, 350.. agrees after.
+        $before = [double[]](@(1.0) * 300 + @(0.0) * 200)
+        $after = [double[]](@(0.0) * 350 + @(1.0) * 150)
+        [MkvAudioMerge.CutMath]::FindCut($before, $after, 50) | Should -Be 300
+    }
+    It 'correlates identical signals as 1 and opposite ones as -1' {
+        $a = [double[]](1..200 | ForEach-Object { [math]::Sin($_ / 5) })
+        $b = [double[]]($a | ForEach-Object { -$_ })
+        $same = [MkvAudioMerge.CutMath]::LocalCorrelation($a, $a, 20)
+        $opp = [MkvAudioMerge.CutMath]::LocalCorrelation($a, $b, 20)
+        [math]::Round($same[100], 6) | Should -Be 1
+        [math]::Round($opp[100], 6) | Should -Be -1
+    }
+}
+
+Describe 'New-MkvMergeArgument with repaired tracks' {
+    It 'leaves the secondary out and adds the rebuilt files with their offset' {
+        $p = New-Info -Path 'C:\p.mkv' -Chapters 10 -Tracks @($video, (New-Track -Id 1 -Language eng -Default), (New-Track -Id 2 -Type subtitles))
+        $s = New-Info -Path 'C:\s.mkv' -Tracks @($video, (New-Track -Id 1 -Language dut))
+        $plan = [pscustomobject]@{
+            Audio = $null; Subtitles = @(); SidecarSubtitle = $null; Chapters = $false
+            External = @(
+                [pscustomobject]@{ Type = 'audio'; Path = 'T:\audio.mka'; LanguageIetf = 'nl'; Name = 'Nederlands'; Channels = 6; SyncMs = 0 }
+                [pscustomobject]@{ Type = 'subtitles'; Path = 'T:\sub.srt'; LanguageIetf = 'nl'; Name = ''; Charset = 'UTF-8'; SyncMs = 120 }
+            )
+        }
+        $a = New-MkvMergeArgument $p $s $plan 'C:\out.partial'
+        $a | Should -Not -Contain 'C:\s.mkv'
+        $a | Should -Contain 'T:\audio.mka'
+        $a | Should -Contain '0:Nederlands'
+        $a | Should -Contain '0:120'
+        $a[-1] | Should -Be '0:0,0:1,1:0,0:2,2:0'
+    }
+    It 'verifies a repaired audio track by language and channels' {
+        $p = New-Info -Chapters 0 -Tracks @($video, (New-Track -Id 1 -Language eng -Default))
+        $plan = [pscustomobject]@{ Audio = $null; Subtitles = @(); Chapters = $false
+            External = @([pscustomobject]@{ Type = 'audio'; Path = 'x'; LanguageIetf = 'nl'; Name = 'NL'; Channels = 6; SyncMs = 0 }) }
+        $good = New-Info -Chapters 0 -Tracks @($video, (New-Track -Id 1 -Language eng -Default), (New-Track -Id 2 -Language dut -Ietf nl))
+        Test-MergedOutput $p $plan $good | Should -BeNullOrEmpty
+        $bad = New-Info -Chapters 0 -Tracks @($video, (New-Track -Id 1 -Language eng -Default), (New-Track -Id 2 -Language dut -Ietf nl -Channels 2))
+        (Test-MergedOutput $p $plan $bad) -match 'missing' | Should -Not -BeNullOrEmpty
+    }
+}
+Describe 'Select-SyncReferenceTrack' {
+    It 'uses the default track unless it is TrueHD' {
+        $eac3 = New-Track -Id 1 -Language eng -CodecId 'A_EAC3' -Default
+        (Select-SyncReferenceTrack @($video, $eac3)).Id | Should -Be 1
+    }
+    It 'prefers a same-language lossy track over a TrueHD default' {
+        $thd = New-Track -Id 1 -Language eng -CodecId 'A_TRUEHD' -Channels 8 -Default
+        $eac3 = New-Track -Id 2 -Language eng -CodecId 'A_EAC3'
+        $fre = New-Track -Id 3 -Language fre -CodecId 'A_AC3'
+        (Select-SyncReferenceTrack @($video, $thd, $fre, $eac3)).Id | Should -Be 2
+        (Select-SyncReferenceTrack @($video, $thd, $fre)).Id | Should -Be 1
+    }
+}
