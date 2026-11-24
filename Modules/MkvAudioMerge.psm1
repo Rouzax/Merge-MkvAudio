@@ -375,7 +375,8 @@ function Get-SyncVerdict {
         Judges a set of offset measurements taken across the film.
     .DESCRIPTION
         With five or more clear points, a single point that disagrees with the rest
-        is set aside as noise and counted in Outliers.
+        and has a weak match (below MaxStrayPeak) is set aside as noise and counted
+        in Outliers. A strong match that disagrees is never set aside.
         Each point has TimeS, OffsetMs (residual, after any applied offset),
         Peak and RunnerUp (correlation scores). A point is reliable when its
         peak is clearly above the runner-up and not at the edge of the search.
@@ -392,7 +393,8 @@ function Get-SyncVerdict {
         [Parameter(Mandatory)][AllowEmptyCollection()][pscustomobject[]]$Point,
         [int]$ToleranceMs = 40,
         [double]$MinPeak = 0.45,
-        [double]$MinMargin = 0.1
+        [double]$MinMargin = 0.1,
+        [double]$MaxStrayPeak = 0.6
     )
 
     $reliable = @($Point | Where-Object { $_.Peak -ge $MinPeak -and ($_.Peak - $_.RunnerUp) -ge $MinMargin -and -not $_.AtEdge })
@@ -415,11 +417,13 @@ function Get-SyncVerdict {
     }
     $median = & $getMedian @($reliable.OffsetMs)
 
-    # With enough clear points, one stray measurement (a quiet, dialogue-only
-    # scene) is noise, not a different cut: set it aside.
+    # With enough clear points, one stray measurement with a weak match (a
+    # quiet, dialogue-only scene) is noise: set it aside. A stray point with a
+    # strong match is real: the films differ there (an extra logo or scene),
+    # and hiding it would merge part of the film out of sync.
     if ($reliable.Count -ge 5) {
         $stray = @($reliable | Where-Object { [math]::Abs($_.OffsetMs - $median) -gt $ToleranceMs })
-        if ($stray.Count -eq 1) {
+        if ($stray.Count -eq 1 -and $stray[0].Peak -lt $MaxStrayPeak) {
             $reliable = @($reliable | Where-Object { $_ -ne $stray[0] })
             $result.Outliers = 1
             $median = & $getMedian @($reliable.OffsetMs)

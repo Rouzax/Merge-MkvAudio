@@ -208,10 +208,20 @@ Describe 'Get-SyncVerdict' {
     It 'flags offsets that jump around' {
         (Get-SyncVerdict (New-SyncPoint 0, 0, 0, 3000, 3000, -2000, 500)).Verdict | Should -Be 'Inconsistent'
     }
-    It 'ignores one stray point among five or more clear ones' {
-        $v = Get-SyncVerdict (New-SyncPoint 0, 0, 0, 0, 60, 0, 0)
+    It 'ignores one weak stray point among five or more clear ones' {
+        $pts = @(New-SyncPoint 0, 0, 0, 0, 60, 0, 0)
+        $pts[4].Peak = 0.5
+        $v = Get-SyncVerdict $pts
         $v.Verdict | Should -Be 'InSync'
         $v.Outliers | Should -Be 1
+    }
+    It 'never ignores a strong stray point (an extra scene early in one release)' {
+        # Real case: -1010 ms at the first point, -7760 ms from then on.
+        $pts = @(New-SyncPoint -1010, -7760, -7760, -7760, -7760, -7760, -7760)
+        $pts[0].Peak = 0.79
+        $v = Get-SyncVerdict $pts
+        $v.Verdict | Should -Be 'Inconsistent'
+        $v.Outliers | Should -Be 0
     }
     It 'does not ignore two stray points' {
         (Get-SyncVerdict (New-SyncPoint 0, 0, 0, 0, 900, 0, 1500)).Verdict | Should -Be 'Inconsistent'
