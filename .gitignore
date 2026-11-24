@@ -1,0 +1,22 @@
+# IDE and editor files
+.vscode/
+*.code-workspace
+.idea/
+
+# OS files
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Claude workspace and development files
+.claude/
+CLAUDE.md
+docs/superpowers/
+.worktrees/
+
+# Local scratch and test media
+_temp/
+*.mkv
+*.partial
+*.bak
+coverage.xml
