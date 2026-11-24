@@ -98,7 +98,7 @@ The Dutch release of an animated film ran 8 seconds short. The first sync point 
 
 The frames show what was missing. The English release has a 6.76-second shot between the pirate ship and the bamboo forest; the Dutch release cuts straight from one to the other, at the moment the script measured. In the merged file the Dutch track plays the English sound for that one shot.
 
-![Frames from both releases around the cut: English shows a ship, a throne-room shot, then a bamboo forest; Dutch goes from the ship straight to the forest](docs/images/cut-example.jpg)
+![Frames from both releases side by side: English shows a ship, three frames of a throne-room shot, then a bamboo forest; in the Dutch column the throne-room rows are a black panel marking the 6.76 s skipped](docs/images/cut-example.jpg)
 
 ## Options
 
